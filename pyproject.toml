@@ -1,0 +1,20 @@
+[project]
+name = "xingji"
+version = "0.1.0"
+description = "个人旅行规划 agent 助手"
+readme = "README.md"
+authors = [
+    { name = "柴敏权", email = "minquan.chai@hand-china.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.139.0",
+    "uvicorn>=0.51.0",
+]
+
+[project.scripts]
+xingji = "xingji.main:main"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
