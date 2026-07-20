@@ -63,8 +63,8 @@ def build_travel_graph() -> StateGraph:
         },
     )
 
-    # refine → generate（总是转发到生成节点）
-    builder.add_edge("refine_plan", "generate_plan")
+    # refine → END（refine_plan 直接输出修改后的完整方案）
+    builder.add_edge("refine_plan", END)
 
     # generate → END
     builder.add_edge("generate_plan", END)

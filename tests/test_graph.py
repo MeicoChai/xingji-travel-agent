@@ -42,46 +42,30 @@ class TestGraphCompilation:
     @pytest.mark.asyncio
     async def test_graph_with_mock_llm_new_plan(self) -> None:
         """模拟 LLM 调用的完整 new_plan 流程。"""
+        import json
+
         mock_llm = MagicMock()
-        mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content="new_plan"))
-
-        # 模拟 parse_requirements 的 structured output
-        mock_parse_result = MagicMock()
-        mock_parse_result.destination = "Tokyo"
-        mock_parse_result.budget = "moderate"
-        mock_parse_result.travelers = 2
-        mock_parse_result.preferences = "喜欢美食"
-        mock_parse_result.requirements_complete = True
-        mock_parse_result.response = ""
-
-        # 模拟 generate_plan 的 structured output
-        mock_plan = TravelPlan(
-            destination="Tokyo",
-            start_date="2026-08-01",
-            end_date="2026-08-03",
-            budget=BudgetLevel.MODERATE,
-            travelers=2,
-            summary="东京三日美食之旅",
-            days=[
-                ItineraryDay(
-                    day=1,
-                    morning="浅草寺",
-                    afternoon="秋叶原",
-                    evening="银座",
-                    meals=["一兰拉面"],
-                ),
-            ],
+        # ainvoke 调用顺序: classify_intent → parse_requirements (JSON) → generate_plan (文本)
+        mock_llm.ainvoke = AsyncMock(
+            side_effect=[
+                MagicMock(content="new_plan"),
+                MagicMock(content=json.dumps({
+                    "destination": "Tokyo",
+                    "start_date": "2026-08-01",
+                    "end_date": "2026-08-03",
+                    "budget": "moderate",
+                    "travelers": 2,
+                    "preferences": "喜欢美食",
+                    "requirements_complete": True,
+                    "response": "",
+                })),
+                MagicMock(content="## Tokyo 旅行方案\n\n这是一份详细的旅行方案..."),
+            ]
         )
 
         graph = build_travel_graph()
 
         with patch("xingji.agent.nodes._get_llm", return_value=mock_llm):
-            mock_structured = MagicMock()
-            mock_structured.ainvoke = AsyncMock(
-                side_effect=[mock_parse_result, mock_plan]
-            )
-            mock_llm.with_structured_output.return_value = mock_structured
-
             compiled = graph.compile(checkpointer=MemorySaver())
             state: TravelPlanState = {
                 "messages": [HumanMessage(content="帮我规划一个3天的东京旅行")],
@@ -95,29 +79,34 @@ class TestGraphCompilation:
             result = await compiled.ainvoke(state, config)
 
         assert result["intent"] in ("new_plan", "refine_plan")
-        assert result["plan"] is not None
         assert result["response"] != ""
 
     @pytest.mark.asyncio
     async def test_graph_parse_incomplete_triggers_clarify(self) -> None:
         """当信息不完整时，graph 应该在 parse 后直接结束（返回追问）。"""
-        mock_llm = MagicMock()
-        mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content="new_plan"))
+        import json
 
-        mock_parse_result = MagicMock()
-        mock_parse_result.destination = None
-        mock_parse_result.budget = None
-        mock_parse_result.travelers = None
-        mock_parse_result.preferences = None
-        mock_parse_result.requirements_complete = False
-        mock_parse_result.response = "请问你想去哪里？什么时候出发？"
+        mock_llm = MagicMock()
+        # classify_intent → parse_requirements (返回不完整 JSON)
+        mock_llm.ainvoke = AsyncMock(
+            side_effect=[
+                MagicMock(content="new_plan"),
+                MagicMock(content=json.dumps({
+                    "destination": None,
+                    "start_date": None,
+                    "end_date": None,
+                    "budget": None,
+                    "travelers": None,
+                    "preferences": None,
+                    "requirements_complete": False,
+                    "response": "请问你想去哪里？什么时候出发？",
+                })),
+            ]
+        )
 
         graph = build_travel_graph()
 
         with patch("xingji.agent.nodes._get_llm", return_value=mock_llm):
-            mock_structured = MagicMock()
-            mock_structured.ainvoke = AsyncMock(return_value=mock_parse_result)
-            mock_llm.with_structured_output.return_value = mock_structured
 
             compiled = graph.compile(checkpointer=MemorySaver())
             state: TravelPlanState = {

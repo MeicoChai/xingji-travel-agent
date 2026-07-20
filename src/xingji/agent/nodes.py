@@ -1,12 +1,12 @@
 """Graph 节点函数 — 每个节点是一个异步函数，接收 state 返回部分 state 更新。"""
 
+import json
 import logging
-from typing import Optional
+import re
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
 
 from xingji.agent.prompts import (
     CLASSIFY_INTENT_PROMPT,
@@ -17,7 +17,7 @@ from xingji.agent.prompts import (
 from xingji.agent.state import TravelPlanState
 from xingji.config import settings
 from xingji.exceptions import AgentException, ExternalServiceException
-from xingji.schemas.travel import TravelPlan, TravelRequirements
+from xingji.schemas.travel import BudgetLevel, TravelRequirements
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ def _get_llm() -> BaseChatModel:
                 model=settings.openai_model,
                 api_key=settings.openai_api_key,
                 base_url=settings.openai_base_url or None,
-                temperature=0.7,
+                temperature=settings.llm_temperature,
             )
         else:
             raise AgentException(f"不支持的 LLM provider: {settings.llm_provider}")
@@ -49,21 +49,28 @@ def _get_llm() -> BaseChatModel:
 
 
 # ---------------------------------------------------------------------------
-# 结构化输出的辅助模型
+# 辅助函数
 # ---------------------------------------------------------------------------
 
 
-class _ParseResult(BaseModel):
-    """parse_requirements 节点的结构化输出。"""
+def _safe_enum(value: str | None, enum_cls: type) -> str | None:
+    """安全转换字符串为枚举值，非法值返回 None。"""
+    if not value:
+        return None
+    try:
+        enum_cls(value)
+        return value
+    except ValueError:
+        return None
 
-    destination: Optional[str] = None
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    budget: Optional[str] = None
-    travelers: Optional[int] = None
-    preferences: Optional[str] = None
-    requirements_complete: bool = False
-    response: str = ""
+
+def _extract_json(text: str) -> dict:
+    """从 LLM 文本响应中提取 JSON，处理 markdown 代码块包裹。"""
+    # 移除 markdown 代码块标记
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+    text = re.sub(r"\n?```\s*$", "", text)
+    return json.loads(text)
 
 
 # ---------------------------------------------------------------------------
@@ -113,42 +120,58 @@ async def parse_requirements(state: TravelPlanState) -> dict:
         return {"requirements_complete": False, "response": "请告诉我你的旅行需求。"}
 
     llm = _get_llm()
-    structured_llm = llm.with_structured_output(_ParseResult)
 
     try:
-        parse_result: _ParseResult = await structured_llm.ainvoke([
+        result = await llm.ainvoke([
             SystemMessage(content=PARSE_REQUIREMENTS_PROMPT),
             HumanMessage(content=messages[-1].content),
         ])
+        raw_text = result.content if hasattr(result, "content") else str(result)
+        data = _extract_json(raw_text)
+    except json.JSONDecodeError as e:
+        logger.warning("JSON parse failed in parse_requirements: %s", e)
+        # JSON 解析失败时降级：直接追问用户
+        return {
+            "requirements": TravelRequirements(),
+            "requirements_complete": False,
+            "response": "抱歉，我没能完全理解你的需求。能再详细说说想去哪里、什么时候出发吗？",
+        }
     except Exception as e:
-        logger.exception("LLM structured output failed in parse_requirements")
+        logger.exception("LLM call failed in parse_requirements")
         raise ExternalServiceException(f"需求解析失败: {e}") from e
 
-    # 构建 TravelRequirements
-    requirements = TravelRequirements(
-        destination=parse_result.destination,
-        budget=parse_result.budget,
-        travelers=parse_result.travelers,
-        preferences=parse_result.preferences,
-    )
+    # 安全提取字段
+    budget = _safe_enum(data.get("budget"), BudgetLevel)
+    travelers = data.get("travelers")
+    if travelers is not None and (not isinstance(travelers, int) or travelers < 1):
+        travelers = None
+
+    try:
+        requirements = TravelRequirements(
+            destination=data.get("destination") or None,
+            budget=budget,
+            travelers=travelers,
+            preferences=data.get("preferences") or None,
+        )
+    except Exception as e:
+        logger.warning("Failed to construct TravelRequirements: %s", e)
+        requirements = TravelRequirements()
 
     return {
         "requirements": requirements,
-        "requirements_complete": parse_result.requirements_complete,
-        "response": parse_result.response,
+        "requirements_complete": data.get("requirements_complete", False),
+        "response": data.get("response", ""),
     }
 
 
 async def generate_plan(state: TravelPlanState) -> dict:
-    """根据 TravelRequirements 生成逐日旅行方案。"""
+    """根据 TravelRequirements 生成逐日旅行方案（纯文本 Markdown 输出）。"""
     requirements = state.get("requirements")
     if requirements is None:
         return {"response": "无法生成方案：缺少旅行需求信息。", "plan": None}
 
     llm = _get_llm()
-    structured_llm = llm.with_structured_output(TravelPlan)
 
-    # 构建 prompt，把结构化需求注入
     req_text = (
         f"目的地: {requirements.destination or '待定'}\n"
         f"出行日期: {requirements.start_date or '待定'} 至 {requirements.end_date or '待定'}\n"
@@ -158,23 +181,20 @@ async def generate_plan(state: TravelPlanState) -> dict:
     )
 
     try:
-        plan: TravelPlan = await structured_llm.ainvoke([
+        result = await llm.ainvoke([
             SystemMessage(content=GENERATE_PLAN_PROMPT),
             HumanMessage(content=f"请根据以下需求生成旅行方案：\n\n{req_text}"),
         ])
+        response_text = result.content if hasattr(result, "content") else str(result)
     except Exception as e:
-        logger.exception("LLM structured output failed in generate_plan")
+        logger.exception("LLM call failed in generate_plan")
         raise ExternalServiceException(f"方案生成失败: {e}") from e
 
-    from datetime import datetime
-    plan.generated_at = datetime.now()
-    response_text = _format_plan_as_text(plan)
-
-    return {"plan": plan, "response": response_text}
+    return {"plan": None, "response": response_text}
 
 
 async def refine_plan(state: TravelPlanState) -> dict:
-    """根据用户反馈修改旅行需求。"""
+    """根据用户反馈修改旅行需求，然后重新生成方案。"""
     messages = state.get("messages", [])
     requirements = state.get("requirements")
 
@@ -185,61 +205,24 @@ async def refine_plan(state: TravelPlanState) -> dict:
     current_req = requirements.model_dump_json(indent=2) if requirements else "{}"
 
     llm = _get_llm()
-    structured_llm = llm.with_structured_output(TravelRequirements)
-
     refine_prompt = REFINE_PLAN_PROMPT.format(
         current_requirements=current_req,
         user_feedback=user_feedback,
     )
 
     try:
-        updated: TravelRequirements = await structured_llm.ainvoke([
+        result = await llm.ainvoke([
             SystemMessage(content=refine_prompt),
             HumanMessage(content=f"请更新需求: {user_feedback}"),
         ])
+        response_text = result.content if hasattr(result, "content") else str(result)
     except Exception as e:
-        logger.exception("LLM structured output failed in refine_plan")
+        logger.exception("LLM call failed in refine_plan")
         raise ExternalServiceException(f"方案修改失败: {e}") from e
 
-    return {"requirements": updated, "requirements_complete": True, "response": ""}
+    return {"requirements_complete": True, "response": response_text}
 
 
 # ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------
-
-
-def _format_plan_as_text(plan: TravelPlan) -> str:
-    """将结构化 TravelPlan 格式化为可读文本。"""
-    lines = [
-        f"## {plan.destination} 旅行方案",
-        f"",
-        f"- **日期**: {plan.start_date} 至 {plan.end_date}",
-        f"- **预算**: {plan.budget.value}",
-        f"- **人数**: {plan.travelers}人",
-        f"",
-        f"### 行程概览",
-        f"{plan.summary}",
-        f"",
-    ]
-
-    for day in plan.days:
-        lines.append(f"### 第{day.day}天" + (f"（{day.day_date}）" if day.day_date else ""))
-        if day.morning:
-            lines.append(f"- ☀️ 上午: {day.morning}")
-        if day.afternoon:
-            lines.append(f"- 🌤️ 下午: {day.afternoon}")
-        if day.evening:
-            lines.append(f"- 🌙 晚间: {day.evening}")
-        if day.meals:
-            lines.append(f"- 🍽️ 餐饮: {' / '.join(day.meals)}")
-        if day.estimated_cost:
-            lines.append(f"- 💰 预估花费: {day.estimated_cost}")
-        if day.notes:
-            lines.append(f"- 📝 {day.notes}")
-        lines.append("")
-
-    if plan.total_estimated_cost:
-        lines.append(f"### 总预估花费: {plan.total_estimated_cost}")
-
-    return "\n".join(lines)

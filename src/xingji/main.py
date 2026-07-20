@@ -2,10 +2,12 @@
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.staticfiles import StaticFiles
 
 from xingji.api.router import api_router
 from xingji.config import settings
@@ -37,6 +39,11 @@ app = FastAPI(
 )
 
 app.include_router(api_router)
+
+# 挂载静态前端页面（在 API 路由之后，API 优先匹配）
+static_dir = Path(__file__).parent.parent.parent / "static"
+if static_dir.exists():
+    app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
 
 @app.exception_handler(XingjiException)

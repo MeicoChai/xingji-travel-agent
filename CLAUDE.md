@@ -140,7 +140,13 @@ tests/               # 测试用例
 
 ### 7. Git 规范
 
-- **分支策略**：`main` 分支保持稳定可部署。开发时从 `main` 创建 feature 分支，命名格式 `feat/<功能简述>` 或 `fix/<修复简述>`
+- **PR 工作流（强制）**：所有需求改动必须通过 Pull Request 流程，**禁止直接在 `main` 分支修改和 push 代码**
+  1. 从 `main` 创建 feature/fix 分支：`git checkout -b feat/<功能简述>` 或 `git checkout -b fix/<修复简述>`
+  2. 在分支上开发和提交
+  3. Push 分支到远端：`git push origin <branch-name>`
+  4. 在 GitHub 创建 Pull Request，填写变更说明
+  5. 通过 review + CI 后 squash merge 到 `main`
+- **分支命名**：`feat/<功能简述>`（新功能）、`fix/<修复简述>`（bug 修复）、`refactor/<简述>`（重构）、`docs/<简述>`（文档）
 - **Commit 信息**：使用约定式提交格式（Conventional Commits）：
   ```
   <type>(<scope>): <subject>
